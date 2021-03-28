@@ -1,0 +1,107 @@
+重写RedisRateLimiter来实现自己的限流策略，结合Lua
+
+// routeId也就是我们的fsh-house，id就是限流的key，也就是localhost。
+public Mono<Response> isAllowed(String routeId, String id) {
+ // 会判断RedisRateLimiter是否初始化了
+ if (!this.initialized.get()) {
+  throw new IllegalStateException("RedisRateLimiter is not initialized");
+ }
+ // 获取routeId对应的限流配置
+ Config routeConfig = getConfig().getOrDefault(routeId, defaultConfig);
+
+ if (routeConfig == null) {
+  throw new IllegalArgumentException("No Configuration found for route " + routeId);
+ }
+
+ // 允许用户每秒做多少次请求
+ int replenishRate = routeConfig.getReplenishRate();
+
+ // 令牌桶的容量，允许在一秒钟内完成的最大请求数
+ int burstCapacity = routeConfig.getBurstCapacity();
+
+ try {
+  // 限流key的名称（request_rate_limiter.{localhost}.timestamp，request_rate_limiter.{localhost}.tokens）
+  List<String> keys = getKeys(id);
+
+
+  // The arguments to the LUA script. time() returns unixtime in seconds.
+  List<String> scriptArgs = Arrays.asList(replenishRate + "", burstCapacity + "",
+    Instant.now().getEpochSecond() + "", "1");
+  // allowed, tokens_left = redis.eval(SCRIPT, keys, args)
+  // 执行LUA脚本
+  Flux<List<Long>> flux = this.redisTemplate.execute(this.script, keys, scriptArgs);
+    // .log("redisratelimiter", Level.FINER);
+  return flux.onErrorResume(throwable -> Flux.just(Arrays.asList(1L, -1L)))
+    .reduce(new ArrayList<Long>(), (longs, l) -> {
+     longs.addAll(l);
+     return longs;
+    }) .map(results -> {
+     boolean allowed = results.get(0) == 1L;
+     Long tokensLeft = results.get(1);
+
+     Response response = new Response(allowed, getHeaders(routeConfig, tokensLeft));
+
+     if (log.isDebugEnabled()) {
+      log.debug("response: " + response);
+     }
+     return response;
+    });
+ }
+ catch (Exception e) {
+  log.error("Error determining if user allowed from redis", e);
+ }
+ return Mono.just(new Response(true, getHeaders(routeConfig, -1L)));
+}
+
+
+local tokens_key = KEYS[1]
+local timestamp_key = KEYS[2]
+--redis.log(redis.LOG_WARNING, "tokens_key " .. tokens_key)
+
+local rate = tonumber(ARGV[1])
+local capacity = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local requested = tonumber(ARGV[4])
+
+local fill_time = capacity/rate
+local ttl = math.floor(fill_time*2)
+
+--redis.log(redis.LOG_WARNING, "rate " .. ARGV[1])
+--redis.log(redis.LOG_WARNING, "capacity " .. ARGV[2])
+--redis.log(redis.LOG_WARNING, "now " .. ARGV[3])
+--redis.log(redis.LOG_WARNING, "requested " .. ARGV[4])
+--redis.log(redis.LOG_WARNING, "filltime " .. fill_time)
+--redis.log(redis.LOG_WARNING, "ttl " .. ttl)
+
+local last_tokens = tonumber(redis.call("get", tokens_key))
+if last_tokens == nil then
+ last_tokens = capacity
+end
+--redis.log(redis.LOG_WARNING, "last_tokens " .. last_tokens)
+
+local last_refreshed = tonumber(redis.call("get", timestamp_key))
+if last_refreshed == nil then
+ last_refreshed = 0
+end
+--redis.log(redis.LOG_WARNING, "last_refreshed " .. last_refreshed)
+
+local delta = math.max(0, now-last_refreshed)
+local filled_tokens = math.min(capacity, last_tokens+(delta*rate))
+local allowed = filled_tokens >= requested
+local new_tokens = filled_tokens
+local allowed_num = 0
+if allowed then
+ new_tokens = filled_tokens - requested
+ allowed_num = 1
+end
+
+--redis.log(redis.LOG_WARNING, "delta " .. delta)
+--redis.log(redis.LOG_WARNING, "filled_tokens " .. filled_tokens)
+--redis.log(redis.LOG_WARNING, "allowed_num " .. allowed_num)
+--redis.log(redis.LOG_WARNING, "new_tokens " .. new_tokens)
+
+redis.call("setex", tokens_key, ttl, new_tokens)
+redis.call("setex", timestamp_key, ttl, now)
+
+return { allowed_num, new_tokens }
+
